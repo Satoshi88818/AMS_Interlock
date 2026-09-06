@@ -1,0 +1,153 @@
+// =============================================================================
+// gate_permit_validator_tb.v — Testbench (simulation only, teaching model)
+// =============================================================================
+//
+// Mirrors, scenario-for-scenario, the tests already written and passing
+// against the Python reference model in test_clock_synchronization.py:
+//   test_permit_valid_within_budget
+//   test_permit_exactly_at_budget_is_valid
+//   test_permit_expired_beyond_budget
+//   test_missing_permit_rejected
+//   test_future_timestamped_permit_rejected
+//   test_permit_validation_unaffected_by_edge_wall_clock_value (conceptually --
+//     this module has no wall-clock input at all, which is the RTL version
+//     of that same property: it can't be affected by a clock it doesn't have)
+//
+// This is what "the code was actually run and checked" looks like for RTL,
+// matching the standard already held for every Python module in this series.
+// =============================================================================
+
+`timescale 1us/1ns
+
+module gate_permit_validator_tb;
+
+    localparam TICK_WIDTH = 32;
+
+    reg                     clk;
+    reg                     rst_n;
+    reg  [TICK_WIDTH-1:0]   shared_ticks;
+    reg                     permit_valid_in;
+    reg  [TICK_WIDTH-1:0]   permit_issued_at_in;
+    reg  [TICK_WIDTH-1:0]   permit_max_age;
+    wire                    gate_may_open;
+
+    integer errors;
+    integer checks;
+
+    gate_permit_validator #(.TICK_WIDTH(TICK_WIDTH)) dut (
+        .clk(clk),
+        .rst_n(rst_n),
+        .shared_ticks(shared_ticks),
+        .permit_valid_in(permit_valid_in),
+        .permit_issued_at_in(permit_issued_at_in),
+        .permit_max_age(permit_max_age),
+        .gate_may_open(gate_may_open)
+    );
+
+    // 1 tick = 1us per the module's timescale; run the clock at 1 tick/cycle
+    // purely for simulation bookkeeping (not a claim about a real clock rate).
+    always #0.5 clk = ~clk;
+
+    task check(input expected, input [255:0] label);
+        begin
+            checks = checks + 1;
+            if (gate_may_open !== expected) begin
+                errors = errors + 1;
+                $display("FAIL: %0s -- expected %b, got %b (shared_ticks=%0d, held issued_at last set=%0d, max_age=%0d)",
+                          label, expected, gate_may_open, shared_ticks, permit_issued_at_in, permit_max_age);
+            end else begin
+                $display("PASS: %0s", label);
+            end
+        end
+    endtask
+
+    task issue_permit(input [TICK_WIDTH-1:0] issued_at, input [TICK_WIDTH-1:0] ticks_now);
+        begin
+            @(negedge clk);
+            shared_ticks         = ticks_now;
+            permit_issued_at_in  = issued_at;
+            permit_valid_in      = 1'b1;
+            @(negedge clk);
+            permit_valid_in      = 1'b0;
+        end
+    endtask
+
+    task advance_ticks_only(input [TICK_WIDTH-1:0] ticks_now);
+        begin
+            @(negedge clk);
+            shared_ticks = ticks_now;
+            @(negedge clk);
+        end
+    endtask
+
+    initial begin
+        clk = 0;
+        rst_n = 0;
+        shared_ticks = 0;
+        permit_valid_in = 0;
+        permit_issued_at_in = 0;
+        permit_max_age = 50;   // matches permit_max_age_us default in InterlockConfig
+        errors = 0;
+        checks = 0;
+
+        // -- reset --
+        repeat (2) @(negedge clk);
+        rst_n = 1;
+        @(negedge clk);
+        check(1'b0, "reset state: no permit ever received -> gate_may_open must be 0");
+
+        // -- test_missing_permit_rejected --
+        advance_ticks_only(1000);
+        check(1'b0, "no permit issued yet, ticks advanced -> still rejected");
+
+        // -- test_permit_valid_within_budget (30us old, budget 50us) --
+        issue_permit(1000, 1000);
+        advance_ticks_only(1030);
+        check(1'b1, "permit valid within budget (age=30, max=50)");
+
+        // -- test_permit_exactly_at_budget_is_valid (exactly 50us old) --
+        advance_ticks_only(1050);
+        check(1'b1, "permit exactly at budget boundary (age=50, max=50)");
+
+        // -- test_permit_expired_beyond_budget (60us old) --
+        advance_ticks_only(1060);
+        check(1'b0, "permit expired beyond budget (age=60, max=50)");
+
+        // -- test_future_timestamped_permit_rejected --
+        issue_permit(2000, 1000);  // issued_at (2000) is AFTER current ticks (1000)
+        check(1'b0, "future-timestamped permit rejected (fail closed)");
+
+        // -- edge crash / stop-refreshing scenario (mirrors
+        //    test_edge_crash_closes_gate_within_permit_budget in
+        //    test_hardware_simulation.py): issue one valid permit, then
+        //    simply stop issuing new ones and let ticks advance past budget,
+        //    with no explicit "revoke" -- this is the fail-closed-by-aging
+        //    property, now checked at the RTL level. --
+        issue_permit(5000, 5000);
+        advance_ticks_only(5010);
+        check(1'b1, "fresh permit valid immediately after 'edge crash' instant");
+        advance_ticks_only(5060);  // 60us later, no new permit issued (simulated crash)
+        check(1'b0, "gate closes on its own once held permit goes stale, no revoke signal needed");
+
+        // -- clock-domain-independence property, RTL version: this module
+        //    has no wall-clock input at all, so there is nothing to prove
+        //    "unaffected by edge wall-clock skew" against by fuzzing a value
+        //    -- the absence of that input IS the property, matching the
+        //    structural signature-inspection test in
+        //    test_clock_synchronization.py (test_heartbeat_apis_carry_no_
+        //    cross_actor_timestamp) rather than a numeric assertion. Recorded
+        //    here as documentation, not as an executable check, since there
+        //    is no such input to exercise.
+        $display("NOTE: gate_permit_validator has no wall-clock input port -- structurally cannot be affected by edge-clock skew, mirroring test_heartbeat_apis_carry_no_cross_actor_timestamp's signature-inspection approach in the Python suite.");
+
+        $display("----------------------------------------------------------");
+        if (errors == 0)
+            $display("ALL %0d CHECKS PASSED", checks);
+        else
+            $display("%0d OF %0d CHECKS FAILED", errors, checks);
+        $display("----------------------------------------------------------");
+
+        $finish;
+    end
+
+endmodule

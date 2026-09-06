@@ -1,0 +1,143 @@
+// =============================================================================
+// gate_permit_validator.v  —  TEACHING MODEL ONLY. NOT FOR SYNTHESIS OR DEPLOYMENT.
+// =============================================================================
+//
+// WHAT THIS IS:
+//   An illustrative, simulation-only Verilog mapping of the FPGA-side permit
+//   check described in clock_sync.py (FpgaGateValidator) and the Tier 0
+//   interlock spec, Section 5 ("the fastest loop should have the least logic").
+//   It exists to show, concretely, how that Python reference model's logic
+//   COULD be expressed in a hardware description language -- nothing more.
+//
+// WHAT THIS IS NOT:
+//   - It is NOT verified against any FPGA vendor toolchain, timing constraint
+//     set, or synthesis flow.
+//   - It has NOT been through static timing analysis, formal verification,
+//     clock-domain-crossing (CDC) analysis, or any hardware safety process
+//     (IEC 62304 / IEC 60601 / DO-254 or equivalent).
+//   - It does NOT model real gate signal race conditions, metastability at
+//     the shared-counter boundary, glitch behavior, or power-up/reset safety.
+//   - It must NEVER be synthesized, loaded onto real hardware, or connected
+//     to anything that can deliver a particle beam, under any circumstances.
+//
+// A real implementation for that purpose must be produced and independently
+// verified by qualified hardware/RTL engineers through a certified process,
+// per the open items already flagged in
+// AMSv10_Hardware_Simulation_Full_Validated_Implementation.md and
+// AMSv10_Choke_Point_Refactor_Full_Validated_Implementation.md.
+//
+// MAPPING TO THE PYTHON REFERENCE MODEL (clock_sync.py):
+//
+//   class FpgaGateValidator:
+//       def __init__(self, permit_max_age_us):
+//           self.permit_max_age_us = permit_max_age_us
+//
+//       def validate(self, permit, current_shared_ticks_us):
+//           if permit is None:
+//               return False
+//           age_us = current_shared_ticks_us - permit.issued_at_us
+//           if age_us < 0:
+//               return False        # future-timestamped permit -> reject
+//           return age_us <= self.permit_max_age_us
+//
+//   This module implements exactly that comparison as combinational logic,
+//   re-evaluated every clock cycle against the shared counter -- matching
+//   the Python model's "no unit conversion, no skew compensation" design
+//   note, because both sides read the same counter (see
+//   AMSv10_Clock_Synchronization_Design.md, Section 3).
+//
+// =============================================================================
+
+`timescale 1us/1ns  // 1 time unit = 1 microsecond, matching the Python model's
+                     // microsecond tick domain. This timescale choice is a
+                     // TEACHING CONVENIENCE, not a claim about real FPGA clock
+                     // periods (a real design would run at MHz-GHz clocks and
+                     // count cycles, not simulated microseconds directly).
+
+module gate_permit_validator #(
+    parameter TICK_WIDTH = 32   // width of the shared counter, in "ticks"
+                                 // (Python model uses microseconds directly;
+                                 // a real design would pick a width matching
+                                 // its actual shared-counter hardware)
+)(
+    input  wire                    clk,
+    input  wire                    rst_n,           // active-low synchronous reset
+
+    // Shared FPGA<->edge counter value, read directly -- NOT derived from
+    // this module's own clock. In the real design (see
+    // AMSv10_Clock_Synchronization_Design.md) this comes from the same
+    // physical counter the edge SoC reads, not from a locally-synthesized
+    // clock, which is the entire point of the shared-counter design: there
+    // is no clock-domain-crossing skew to reason about because it is
+    // literally one signal, not two synchronized ones.
+    input  wire [TICK_WIDTH-1:0]   shared_ticks,
+
+    // Permit interface: the edge writes a new permit by pulsing
+    // permit_valid_in for one cycle with permit_issued_at_in set. The FPGA
+    // holds the most recently received permit and re-validates it every
+    // cycle against the current shared_ticks value -- mirroring
+    // FpgaGateHardware.receive_permit()/cycle() in hardware_simulator.py,
+    // where the FPGA never trusts anything except permit age.
+    input  wire                    permit_valid_in,
+    input  wire [TICK_WIDTH-1:0]   permit_issued_at_in,
+
+    // permit_max_age is exposed as a runtime input (not a hardcoded
+    // parameter) specifically because the Python model treats it as a
+    // config value pending clinical sign-off (FMEA #7 in
+    // AMSv10_Interlock_FMEA_and_Validated_Implementation.md) -- this
+    // mirrors that design decision rather than baking in a placeholder.
+    input  wire [TICK_WIDTH-1:0]   permit_max_age,
+
+    output reg                     gate_may_open    // the ONLY output --
+                                                     // deliberately not named
+                                                     // "gate_open": this module
+                                                     // computes whether opening
+                                                     // is PERMITTED, it does not
+                                                     // itself drive beam hardware.
+);
+
+    // Held permit state -- mirrors FpgaGateHardware._held_permit in the
+    // Python model. has_permit distinguishes "no permit ever received" /
+    // "permit explicitly revoked" from "permit received but stale", exactly
+    // as `Optional[GatePermit] = None` does in Python.
+    reg                    has_permit;
+    reg [TICK_WIDTH-1:0]   held_issued_at;
+
+    // Latch/update the held permit. Note this is intentionally NOT combined
+    // with the validity computation below -- receiving a new permit and
+    // validating the currently-held one are two separate concerns, matching
+    // the Python model's separation of receive_permit() and validate()/cycle().
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            has_permit     <= 1'b0;
+            held_issued_at <= {TICK_WIDTH{1'b0}};
+        end else if (permit_valid_in) begin
+            has_permit     <= 1'b1;
+            held_issued_at <= permit_issued_at_in;
+        end
+        // No permit_valid_in this cycle: the held permit is left as-is,
+        // aging naturally against shared_ticks below -- this is what makes
+        // "stop sending permits" (e.g. edge crash) work as a fail-closed
+        // mechanism without any explicit "revoke" signal being required.
+    end
+
+    // Age computation and validity check -- direct translation of
+    // FpgaGateValidator.validate(). Combinational (re-evaluated continuously
+    // against the live shared_ticks value), matching "the fastest loop has
+    // the least logic": no state machine here, just a subtraction and two
+    // comparisons every single cycle.
+    wire signed [TICK_WIDTH:0] age;  // one extra bit to safely represent a
+                                       // negative result before the age<0 check
+    assign age = $signed({1'b0, shared_ticks}) - $signed({1'b0, held_issued_at});
+
+    always @(*) begin
+        if (!has_permit) begin
+            gate_may_open = 1'b0;                    // permit is None -> False
+        end else if (age < 0) begin
+            gate_may_open = 1'b0;                    // future-timestamped -> reject, fail closed
+        end else begin
+            gate_may_open = (age <= $signed({1'b0, permit_max_age}));
+        end
+    end
+
+endmodule

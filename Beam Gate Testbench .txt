@@ -1,0 +1,99 @@
+// =============================================================================
+// beam_gate_top_tb.v — Testbench (simulation only, teaching model)
+// =============================================================================
+// Proves the one property this wrapper exists to illustrate: hw_estop_n
+// always wins, regardless of how "valid" the permit logic thinks its state
+// is -- including the pathological case of a permit that would otherwise
+// read as valid forever.
+// =============================================================================
+
+`timescale 1us/1ns
+
+module beam_gate_top_tb;
+
+    localparam TICK_WIDTH = 32;
+
+    reg                     clk;
+    reg                     rst_n;
+    reg  [TICK_WIDTH-1:0]   shared_ticks;
+    reg                     permit_valid_in;
+    reg  [TICK_WIDTH-1:0]   permit_issued_at_in;
+    reg  [TICK_WIDTH-1:0]   permit_max_age;
+    reg                     hw_estop_n;
+    wire                    beam_gate_open;
+
+    integer errors;
+    integer checks;
+
+    beam_gate_top #(.TICK_WIDTH(TICK_WIDTH)) dut (
+        .clk(clk), .rst_n(rst_n), .shared_ticks(shared_ticks),
+        .permit_valid_in(permit_valid_in),
+        .permit_issued_at_in(permit_issued_at_in),
+        .permit_max_age(permit_max_age),
+        .hw_estop_n(hw_estop_n),
+        .beam_gate_open(beam_gate_open)
+    );
+
+    always #0.5 clk = ~clk;
+
+    task check(input expected, input [255:0] label);
+        begin
+            checks = checks + 1;
+            if (beam_gate_open !== expected) begin
+                errors = errors + 1;
+                $display("FAIL: %0s -- expected %b, got %b", label, expected, beam_gate_open);
+            end else begin
+                $display("PASS: %0s", label);
+            end
+        end
+    endtask
+
+    initial begin
+        clk = 0; rst_n = 0; shared_ticks = 0;
+        permit_valid_in = 0; permit_issued_at_in = 0; permit_max_age = 50;
+        hw_estop_n = 1;  // not asserted
+        errors = 0; checks = 0;
+
+        repeat (2) @(negedge clk);
+        rst_n = 1;
+        @(negedge clk);
+
+        // Issue a valid, fresh permit with estop not asserted -> gate opens.
+        @(negedge clk);
+        shared_ticks = 1000; permit_issued_at_in = 1000; permit_valid_in = 1;
+        @(negedge clk);
+        permit_valid_in = 0;
+        check(1'b1, "valid fresh permit, estop clear -> gate open");
+
+        // Now assert the E-stop with the SAME still-valid permit unchanged.
+        @(negedge clk);
+        hw_estop_n = 0;
+        @(negedge clk);
+        check(1'b0, "E-stop asserted overrides an otherwise-valid permit -> gate closed");
+
+        // Keep refreshing the permit every cycle (simulating a hypothetical
+        // buggy permit validator that always says "valid") while E-stop
+        // stays asserted -- gate must stay closed regardless.
+        @(negedge clk); shared_ticks = 1005; permit_issued_at_in = 1005; permit_valid_in = 1;
+        @(negedge clk); permit_valid_in = 0;
+        check(1'b0, "E-stop still overrides even with a continuously-refreshed 'valid' permit");
+
+        // Release E-stop with a fresh permit -> gate may open again.
+        @(negedge clk);
+        hw_estop_n = 1;
+        shared_ticks = 1006; permit_issued_at_in = 1006; permit_valid_in = 1;
+        @(negedge clk);
+        permit_valid_in = 0;
+        @(negedge clk);
+        check(1'b1, "E-stop released, fresh valid permit -> gate open again");
+
+        $display("----------------------------------------------------------");
+        if (errors == 0)
+            $display("ALL %0d CHECKS PASSED", checks);
+        else
+            $display("%0d OF %0d CHECKS FAILED", errors, checks);
+        $display("----------------------------------------------------------");
+        $finish;
+    end
+
+endmodule

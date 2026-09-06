@@ -1,0 +1,61 @@
+// =============================================================================
+// beam_gate_top.v  —  TEACHING MODEL ONLY. NOT FOR SYNTHESIS OR DEPLOYMENT.
+// =============================================================================
+//
+// Illustrates ONE structural point flagged repeatedly across this project's
+// FMEA (see AMSv10_Interlock_FMEA_and_Validated_Implementation.md, item #9,
+// and the interlock spec's open items): the software/logical permit check
+// must NOT be the only thing standing between the beam and the patient.
+// There must be an independent hardware E-stop path that can force the gate
+// closed regardless of what this module -- or anything upstream of it --
+// computes.
+//
+// THIS MODULE DOES NOT IMPLEMENT THAT E-STOP. It only shows the shape of
+// where one would compose: a raw, hard-wired override input, combined with
+// a simple AND (gate opens only if BOTH the permit logic AND the hardware
+// override agree), so that a stuck-at-1 or otherwise-buggy permit validator
+// can never open the gate on its own. hw_estop_n in this teaching model is
+// just a testbench-driven signal -- a real E-stop would be a physically
+// independent circuit (e.g. a relay in series with the beam power itself),
+// not a logic signal an FPGA bug could route around. That physical
+// independence is exactly the part this simulation cannot demonstrate or
+// substitute for.
+// =============================================================================
+
+`timescale 1us/1ns
+
+module beam_gate_top #(
+    parameter TICK_WIDTH = 32
+)(
+    input  wire                    clk,
+    input  wire                    rst_n,
+    input  wire [TICK_WIDTH-1:0]   shared_ticks,
+    input  wire                    permit_valid_in,
+    input  wire [TICK_WIDTH-1:0]   permit_issued_at_in,
+    input  wire [TICK_WIDTH-1:0]   permit_max_age,
+
+    // Illustrative only -- see module header. Active-low: 0 = stop asserted.
+    input  wire                    hw_estop_n,
+
+    output wire                    beam_gate_open
+);
+
+    wire permit_says_open;
+
+    gate_permit_validator #(.TICK_WIDTH(TICK_WIDTH)) permit_check (
+        .clk(clk),
+        .rst_n(rst_n),
+        .shared_ticks(shared_ticks),
+        .permit_valid_in(permit_valid_in),
+        .permit_issued_at_in(permit_issued_at_in),
+        .permit_max_age(permit_max_age),
+        .gate_may_open(permit_says_open)
+    );
+
+    // The composition point: EITHER input alone being "closed" closes the
+    // gate. No logic here can override hw_estop_n -- there is deliberately
+    // no path in this module that lets permit_says_open force the gate open
+    // while hw_estop_n is asserted.
+    assign beam_gate_open = permit_says_open & hw_estop_n;
+
+endmodule
