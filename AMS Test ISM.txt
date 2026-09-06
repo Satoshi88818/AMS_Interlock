@@ -1,0 +1,298 @@
+"""
+Tests for the Tier 0 edge-cloud interlock state machine.
+
+Each test is written to map directly back to a row in the spec's transition
+table (AMSv10_Edge_Cloud_Interlock_Spec.md, Section 4), so a reviewer can
+check spec coverage by matching test names to table rows.
+
+A fake, manually-advanced clock is used wherever timing thresholds
+(hold timeout, degraded-mode budget) matter, so tests are deterministic
+and don't depend on wall-clock sleeps.
+"""
+
+import pytest
+
+from interlock_state_machine import (
+    InterlockConfig,
+    InterlockError,
+    InterlockStateMachine,
+    State,
+)
+
+
+class FakeClock:
+    """A controllable clock: advance(seconds) moves time forward explicitly."""
+
+    def __init__(self, start: float = 0.0):
+        self._t = start
+
+    def __call__(self) -> float:
+        return self._t
+
+    def advance(self, seconds: float):
+        self._t += seconds
+
+
+@pytest.fixture
+def clock():
+    return FakeClock()
+
+
+@pytest.fixture
+def config():
+    return InterlockConfig(
+        hold_timeout_ms=500.0,
+        heartbeat_miss_threshold=3,
+        degraded_max_duration_s=10.0,
+        degraded_max_dose_fraction_pct=5.0,
+        permit_max_age_us=50.0,
+    )
+
+
+@pytest.fixture
+def fsm(config, clock):
+    return InterlockStateMachine(config=config, clock=clock)
+
+
+def armed(fsm, plan_hash="plan-A"):
+    fsm.self_test_pass(plan_hash)
+    return fsm
+
+
+def delivering(fsm, plan_hash="plan-A"):
+    armed(fsm, plan_hash)
+    fsm.clinician_start()
+    return fsm
+
+
+# --------------------------------------------------------------- INIT/ARMED
+
+def test_init_self_test_pass_to_armed(fsm):
+    fsm.self_test_pass("plan-A")
+    assert fsm.state == State.ARMED
+
+
+def test_init_self_test_fail_to_fault(fsm):
+    fsm.self_test_fail("handshake timeout")
+    assert fsm.state == State.FAULT
+
+
+def test_armed_clinician_start_to_delivering(fsm):
+    armed(fsm)
+    fsm.clinician_start()
+    assert fsm.state == State.DELIVERING
+
+
+def test_cannot_start_without_arming(fsm):
+    with pytest.raises(InterlockError):
+        fsm.clinician_start()
+
+
+# ---------------------------------------------------------- DELIVERING/HOLD
+
+def test_tolerance_exceeded_enters_hold(fsm):
+    delivering(fsm)
+    fsm.edge_tolerance_exceeded()
+    assert fsm.state == State.HOLD
+
+
+def test_hold_recovers_to_delivering_within_timeout(fsm, clock):
+    delivering(fsm)
+    fsm.edge_tolerance_exceeded()
+    clock.advance(0.1)  # 100ms, under the 500ms hold timeout
+    fsm.edge_tolerance_ok()
+    assert fsm.state == State.DELIVERING
+
+
+def test_hold_timeout_exceeded_faults(fsm, clock):
+    delivering(fsm)
+    fsm.edge_tolerance_exceeded()
+    clock.advance(0.6)  # 600ms > 500ms hold_timeout_ms
+    fsm.edge_tolerance_exceeded()  # re-checked while still out of tolerance
+    assert fsm.state == State.FAULT
+    assert "hold timeout exceeded" in fsm.audit_log[-1].reason
+
+
+def test_edge_node_fault_from_delivering(fsm):
+    delivering(fsm)
+    fsm.edge_node_fault("ROM inference error")
+    assert fsm.state == State.FAULT
+
+
+def test_edge_node_fault_from_hold(fsm):
+    delivering(fsm)
+    fsm.edge_tolerance_exceeded()
+    fsm.edge_node_fault("sensor dropout")
+    assert fsm.state == State.FAULT
+
+
+# ----------------------------------------------------------- cloud heartbeat
+
+def test_single_heartbeat_miss_does_not_degrade(fsm):
+    delivering(fsm)
+    fsm.cloud_heartbeat_missed()
+    assert fsm.state == State.DELIVERING
+
+
+def test_heartbeat_misses_below_threshold_stay_delivering(fsm):
+    delivering(fsm)
+    fsm.cloud_heartbeat_missed()
+    fsm.cloud_heartbeat_missed()
+    assert fsm.state == State.DELIVERING  # threshold is 3
+
+
+def test_heartbeat_misses_at_threshold_enters_degraded(fsm):
+    delivering(fsm)
+    fsm.cloud_heartbeat_missed()
+    fsm.cloud_heartbeat_missed()
+    fsm.cloud_heartbeat_missed()
+    assert fsm.state == State.DEGRADED_EDGE_ONLY
+
+
+def test_degraded_resumes_delivering_on_matching_plan_hash(fsm):
+    delivering(fsm, plan_hash="plan-A")
+    for _ in range(3):
+        fsm.cloud_heartbeat_missed()
+    assert fsm.state == State.DEGRADED_EDGE_ONLY
+
+    fsm.cloud_heartbeat_received("plan-A")
+    assert fsm.state == State.DELIVERING
+
+
+def test_degraded_resumes_to_hold_if_that_was_the_prior_state(fsm):
+    delivering(fsm, plan_hash="plan-A")
+    fsm.edge_tolerance_exceeded()  # -> HOLD
+    for _ in range(3):
+        fsm.cloud_heartbeat_missed()
+    assert fsm.state == State.DEGRADED_EDGE_ONLY
+
+    fsm.cloud_heartbeat_received("plan-A")
+    assert fsm.state == State.HOLD
+
+
+def test_degraded_plan_hash_mismatch_faults_no_auto_reconcile(fsm):
+    delivering(fsm, plan_hash="plan-A")
+    for _ in range(3):
+        fsm.cloud_heartbeat_missed()
+    assert fsm.state == State.DEGRADED_EDGE_ONLY
+
+    fsm.cloud_heartbeat_received("plan-B")  # cloud has a different plan now
+    assert fsm.state == State.FAULT
+    assert "MISMATCH" in fsm.audit_log[-1].reason
+
+
+def test_degraded_duration_budget_exceeded_faults(fsm, clock):
+    delivering(fsm)
+    for _ in range(3):
+        fsm.cloud_heartbeat_missed()
+    assert fsm.state == State.DEGRADED_EDGE_ONLY
+
+    clock.advance(11.0)  # > degraded_max_duration_s (10.0)
+    fsm.cloud_heartbeat_missed()  # re-checked while still degraded
+    assert fsm.state == State.FAULT
+    assert "duration budget exceeded" in fsm.audit_log[-1].reason
+
+
+def test_degraded_dose_budget_exceeded_faults(fsm):
+    delivering(fsm)
+    for _ in range(3):
+        fsm.cloud_heartbeat_missed()
+    assert fsm.state == State.DEGRADED_EDGE_ONLY
+
+    fsm.record_degraded_dose(3.0)
+    assert fsm.state == State.DEGRADED_EDGE_ONLY  # 3% < 5% budget
+    fsm.record_degraded_dose(3.0)  # cumulative 6% > 5% budget
+    assert fsm.state == State.FAULT
+    assert "dose budget exceeded" in fsm.audit_log[-1].reason
+
+
+def test_cloud_plan_invalidated_faults(fsm):
+    delivering(fsm)
+    fsm.cloud_plan_invalidated("post-hoc constraint violation detected")
+    assert fsm.state == State.FAULT
+
+
+# -------------------------------------------------------- manual stop / recovery
+
+def test_manual_stop_from_delivering(fsm):
+    delivering(fsm)
+    fsm.manual_stop()
+    assert fsm.state == State.MANUAL_STOP
+
+
+def test_manual_stop_from_hold(fsm):
+    delivering(fsm)
+    fsm.edge_tolerance_exceeded()
+    fsm.manual_stop()
+    assert fsm.state == State.MANUAL_STOP
+
+
+def test_manual_stop_is_idempotent_from_fault(fsm):
+    delivering(fsm)
+    fsm.edge_node_fault("test fault")
+    fsm.manual_stop()  # should not raise, should not overwrite FAULT
+    assert fsm.state == State.FAULT
+
+
+def test_recovery_from_fault_to_armed(fsm):
+    delivering(fsm)
+    fsm.edge_node_fault("test fault")
+    fsm.begin_recovery()
+    assert fsm.state == State.RECOVERY
+    fsm.recovery_pass("plan-A-rev2")
+    assert fsm.state == State.ARMED
+
+
+def test_recovery_from_manual_stop_to_armed(fsm):
+    delivering(fsm)
+    fsm.manual_stop()
+    fsm.begin_recovery()
+    fsm.recovery_pass("plan-A")
+    assert fsm.state == State.ARMED
+
+
+def test_recovery_fail_returns_to_fault(fsm):
+    delivering(fsm)
+    fsm.edge_node_fault("test fault")
+    fsm.begin_recovery()
+    fsm.recovery_fail("root cause not resolved")
+    assert fsm.state == State.FAULT
+
+
+def test_no_automatic_recovery_from_fault(fsm):
+    delivering(fsm)
+    fsm.edge_node_fault("test fault")
+    with pytest.raises(InterlockError):
+        fsm.clinician_start()
+
+
+# ------------------------------------------------------------------ completion
+
+def test_fraction_complete_from_delivering(fsm):
+    delivering(fsm)
+    fsm.fraction_complete()
+    assert fsm.state == State.COMPLETE
+
+
+def test_cannot_complete_from_hold(fsm):
+    delivering(fsm)
+    fsm.edge_tolerance_exceeded()
+    with pytest.raises(InterlockError):
+        fsm.fraction_complete()
+
+
+# ------------------------------------------------------------------- audit log
+
+def test_audit_log_records_every_transition(fsm):
+    delivering(fsm)
+    fsm.edge_tolerance_exceeded()
+    fsm.edge_tolerance_ok()
+    fsm.fraction_complete()
+    transitions = [(e.from_state, e.to_state) for e in fsm.audit_log]
+    assert transitions == [
+        (State.INIT, State.ARMED),
+        (State.ARMED, State.DELIVERING),
+        (State.DELIVERING, State.HOLD),
+        (State.HOLD, State.DELIVERING),
+        (State.DELIVERING, State.COMPLETE),
+    ]

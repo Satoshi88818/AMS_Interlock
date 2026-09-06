@@ -1,0 +1,225 @@
+"""
+AntimatterSim v10 — Edge-Cloud Interlock State Machine (reference implementation)
+
+This is a software reference model of the Tier 0 interlock spec. It is NOT
+hardware-qualified control software and must not be treated as such. Its
+purpose is to:
+
+  - Make every transition in the spec document executable and testable
+  - Serve as the basis for FMEA test-case generation
+  - Give clinical/hardware reviewers a concrete artifact instead of a table
+
+All numeric defaults in InterlockConfig are PLACEHOLDERS pending clinical
+review (see spec section 7, "Open Items"). Do not treat them as clinically
+validated values.
+
+Governing principle: absence of a valid, current, in-tolerance signal is a
+stop condition, never a continue condition.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Callable, Optional
+import time
+
+
+class State(Enum):
+    INIT = auto()
+    ARMED = auto()
+    DELIVERING = auto()
+    HOLD = auto()
+    DEGRADED_EDGE_ONLY = auto()
+    FAULT = auto()
+    MANUAL_STOP = auto()
+    RECOVERY = auto()
+    COMPLETE = auto()
+
+
+TERMINAL_ACTIVE_STATES = (State.FAULT, State.MANUAL_STOP)
+
+
+@dataclass
+class InterlockConfig:
+    hold_timeout_ms: float = 500.0
+    heartbeat_miss_threshold: int = 3
+    degraded_max_duration_s: float = 10.0
+    degraded_max_dose_fraction_pct: float = 5.0
+    permit_max_age_us: float = 50.0
+
+
+@dataclass
+class AuditEvent:
+    timestamp: float
+    actor: str
+    from_state: State
+    to_state: State
+    reason: str
+
+    def __str__(self) -> str:
+        return (f"[{self.timestamp:.6f}] {self.actor}: "
+                f"{self.from_state.name} -> {self.to_state.name} ({self.reason})")
+
+
+class InterlockError(Exception):
+    """Raised when an event is invoked in a state that does not permit it."""
+
+
+class InterlockStateMachine:
+    def __init__(
+        self,
+        config: InterlockConfig,
+        clock: Callable[[], float] = time.monotonic,
+        log_sink: Optional[Callable[[AuditEvent], None]] = None,
+    ):
+        self.config = config
+        self._clock = clock
+        self._log_sink = log_sink or (lambda e: None)
+
+        self.state = State.INIT
+        self._hold_started_at: Optional[float] = None
+        self._degraded_started_at: Optional[float] = None
+        self._degraded_dose_pct: float = 0.0
+        self._consecutive_heartbeat_misses = 0
+        self._last_known_good_plan_hash: Optional[str] = None
+        self._active_plan_hash: Optional[str] = None
+        self.audit_log: list[AuditEvent] = []
+
+    # ---------------------------------------------------------------- utils
+    def _transition(self, to_state: State, actor: str, reason: str):
+        event = AuditEvent(self._clock(), actor, self.state, to_state, reason)
+        self.state = to_state
+        self.audit_log.append(event)
+        self._log_sink(event)
+
+    def _require(self, *allowed: State):
+        if self.state not in allowed:
+            raise InterlockError(
+                f"Event not permitted in state {self.state.name} "
+                f"(requires one of {[s.name for s in allowed]})"
+            )
+
+    # -------------------------------------------------------- INIT / ARMED
+    def self_test_pass(self, plan_hash: str):
+        self._require(State.INIT)
+        self._active_plan_hash = plan_hash
+        self._last_known_good_plan_hash = plan_hash
+        self._transition(State.ARMED, "system", "self-test and handshake passed")
+
+    def self_test_fail(self, reason: str):
+        self._require(State.INIT)
+        self._transition(State.FAULT, "system", f"self-test/handshake failed: {reason}")
+
+    def clinician_start(self):
+        self._require(State.ARMED)
+        self._transition(State.DELIVERING, "clinician", "delivery started")
+
+    # ------------------------------------------------- DELIVERING / HOLD
+    def edge_tolerance_ok(self):
+        self._require(State.DELIVERING, State.HOLD)
+        if self.state == State.HOLD:
+            self._hold_started_at = None
+            self._transition(State.DELIVERING, "edge", "motion/dose back within tolerance")
+
+    def edge_tolerance_exceeded(self):
+        self._require(State.DELIVERING, State.HOLD)
+        if self.state == State.DELIVERING:
+            self._hold_started_at = self._clock()
+            self._transition(State.HOLD, "edge", "motion/dose out of tolerance")
+            return
+        # already in HOLD: check whether we've overstayed our welcome
+        elapsed_ms = (self._clock() - self._hold_started_at) * 1000.0
+        if elapsed_ms > self.config.hold_timeout_ms:
+            self._transition(
+                State.FAULT, "edge",
+                f"hold timeout exceeded ({elapsed_ms:.1f}ms > {self.config.hold_timeout_ms}ms)"
+            )
+
+    def edge_node_fault(self, reason: str):
+        self._require(State.DELIVERING, State.HOLD, State.DEGRADED_EDGE_ONLY)
+        self._transition(State.FAULT, "edge", f"edge node fault: {reason}")
+
+    # ------------------------------------------------------ cloud heartbeat
+    def cloud_heartbeat_received(self, plan_hash: str):
+        if self.state == State.DEGRADED_EDGE_ONLY:
+            self._consecutive_heartbeat_misses = 0
+            if plan_hash == self._last_known_good_plan_hash:
+                resumed = State.HOLD if self._hold_started_at else State.DELIVERING
+                self._degraded_started_at = None
+                self._degraded_dose_pct = 0.0
+                self._transition(resumed, "cloud", "heartbeat restored, plan hash matches")
+            else:
+                self._transition(
+                    State.FAULT, "cloud",
+                    "heartbeat restored but plan hash MISMATCH — no auto-reconcile"
+                )
+        else:
+            self._consecutive_heartbeat_misses = 0
+            self._last_known_good_plan_hash = plan_hash
+
+    def cloud_heartbeat_missed(self):
+        self._require(State.DELIVERING, State.HOLD, State.DEGRADED_EDGE_ONLY)
+        self._consecutive_heartbeat_misses += 1
+
+        if self.state in (State.DELIVERING, State.HOLD):
+            if self._consecutive_heartbeat_misses >= self.config.heartbeat_miss_threshold:
+                self._degraded_started_at = self._clock()
+                self._transition(
+                    State.DEGRADED_EDGE_ONLY, "cloud",
+                    f"{self._consecutive_heartbeat_misses} consecutive heartbeats missed"
+                )
+        else:  # already DEGRADED_EDGE_ONLY
+            self._check_degraded_budget()
+
+    def cloud_plan_invalidated(self, reason: str):
+        self._require(State.DELIVERING, State.HOLD, State.DEGRADED_EDGE_ONLY)
+        self._transition(State.FAULT, "cloud", f"cloud invalidated active plan: {reason}")
+
+    def record_degraded_dose(self, dose_pct_delta: float):
+        """Call periodically while in DEGRADED_EDGE_ONLY to accrue dose against budget."""
+        if self.state != State.DEGRADED_EDGE_ONLY:
+            return
+        self._degraded_dose_pct += dose_pct_delta
+        self._check_degraded_budget()
+
+    def _check_degraded_budget(self):
+        if self.state != State.DEGRADED_EDGE_ONLY:
+            return
+        elapsed_s = self._clock() - self._degraded_started_at
+        if elapsed_s > self.config.degraded_max_duration_s:
+            self._transition(
+                State.FAULT, "edge",
+                f"degraded-mode duration budget exceeded ({elapsed_s:.2f}s)"
+            )
+        elif self._degraded_dose_pct > self.config.degraded_max_dose_fraction_pct:
+            self._transition(
+                State.FAULT, "edge",
+                f"degraded-mode dose budget exceeded ({self._degraded_dose_pct:.2f}%)"
+            )
+
+    # -------------------------------------------------- manual stop / recovery
+    def manual_stop(self):
+        if self.state in TERMINAL_ACTIVE_STATES:
+            return
+        self._transition(State.MANUAL_STOP, "clinician", "manual stop invoked")
+
+    def begin_recovery(self):
+        self._require(State.FAULT, State.MANUAL_STOP)
+        self._transition(State.RECOVERY, "operator", "diagnostic/recovery sequence started")
+
+    def recovery_pass(self, plan_hash: str):
+        self._require(State.RECOVERY)
+        self._active_plan_hash = plan_hash
+        self._last_known_good_plan_hash = plan_hash
+        self._consecutive_heartbeat_misses = 0
+        self._degraded_dose_pct = 0.0
+        self._transition(State.ARMED, "operator", "recovery verified, re-armed")
+
+    def recovery_fail(self, reason: str):
+        self._require(State.RECOVERY)
+        self._transition(State.FAULT, "operator", f"recovery re-verification failed: {reason}")
+
+    # ---------------------------------------------------------- completion
+    def fraction_complete(self):
+        self._require(State.DELIVERING)
+        self._transition(State.COMPLETE, "system", "planned fraction dose delivered")

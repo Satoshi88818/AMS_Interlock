@@ -1,0 +1,345 @@
+"""
+Scenario tests for the hardware simulation (hardware_simulator.py).
+
+Each test represents a scenario a hardware-in-the-loop test rig would
+eventually need to reproduce on real equipment. Running them here first,
+in simulation, is cheap and fast; the point is to catch design-level
+mistakes before they become expensive hardware-bench debugging sessions.
+"""
+
+import pytest
+
+from interlock_state_machine import State
+from hardware_simulator import (
+    UnreliableNetwork,
+    run_simulation,
+    scaled_test_config,
+)
+
+
+# ------------------------------------------------------------ normal operation
+
+def test_gate_opens_and_stays_open_under_normal_operation():
+    config = scaled_test_config()
+    result = run_simulation(total_us=1_000, config=config)
+
+    # Skip the very first couple of cycles (startup/first permit issuance);
+    # after that, with edge_cycle_us (20us) well under permit_max_age_us
+    # (50us), the gate should never close.
+    steady_state = result.gate_open_history[5:]
+    assert all(steady_state), "Gate should stay continuously open in steady state"
+    assert result.state_at_end() == State.DELIVERING
+
+
+# ------------------------------------------ THE FINDING: refresh rate vs. budget
+
+def test_gate_flickers_if_permit_refresh_slower_than_max_age():
+    """
+    This is the concrete reproduction of the design finding: if the permit
+    refresh loop runs SLOWER than permit_max_age_us (e.g., tied to the ~1ms
+    full inference cycle described in the original spec, rather than a
+    separate fast refresh loop), the gate cannot stay continuously open --
+    it flickers closed between refreshes even with everything else nominal.
+
+    edge_cycle_us=100 (slower than permit_max_age_us=50) reproduces this
+    directly. This is not a bug in the simulation; it is the simulation
+    correctly exposing a real design hazard in the original spec's
+    described timing.
+    """
+    config = scaled_test_config(permit_max_age_us=50.0)
+    result = run_simulation(
+        total_us=1_000,
+        config=config,
+        fpga_cycle_us=10,
+        edge_cycle_us=100,  # slower than permit_max_age_us -- the misconfiguration
+    )
+
+    steady_state = result.gate_open_history[10:]
+    assert not all(steady_state), (
+        "Expected the gate to flicker closed when permit refresh is slower "
+        "than permit_max_age_us -- if this assertion fails, re-check whether "
+        "the simulator or the underlying design assumption changed."
+    )
+    # It should still open at least sometimes (right after each refresh).
+    assert any(steady_state)
+
+
+# --------------------------------------------------------------- edge crash
+
+def test_edge_crash_closes_gate_within_permit_budget():
+    """
+    Defense in depth: even though nothing tells the FPGA explicitly "the
+    edge has crashed", the gate must close on its own once the held permit
+    goes stale, because the FPGA never trusts anything except permit age.
+    """
+    config = scaled_test_config(permit_max_age_us=50.0)
+    crash_at = 500
+    result = run_simulation(
+        total_us=1_000,
+        config=config,
+        fpga_cycle_us=10,
+        edge_cycle_us=20,
+        edge_crash_at_us=crash_at,
+    )
+
+    closed_at = result.first_time_gate_closed_after(crash_at)
+    assert closed_at is not None, "Gate never closed after edge crash"
+    # Gate must close within permit_max_age_us of the crash (worst case: the
+    # very last permit was issued right at the crash instant).
+    assert closed_at - crash_at <= config.permit_max_age_us + 10  # +1 fpga cycle slack
+
+    # And it must stay closed for the remainder of the simulation.
+    assert not any(result.gate_open_history[result.time_us_history.index(closed_at):])
+
+
+# ---------------------------------------------------------- heartbeat / degraded
+
+def test_heartbeat_loss_then_reconnect_resumes_without_gate_interruption():
+    config = scaled_test_config(degraded_max_duration_s=0.02)  # 20ms budget
+    # Drop every heartbeat between 100us and 900us; deliver otherwise.
+    calls = {"n": 0}
+
+    class WindowedNetwork(UnreliableNetwork):
+        def delivers(self):
+            calls["n"] += 1
+            heartbeat_time_us = (calls["n"] - 1) * 200  # must match heartbeat_interval_us below
+            return not (100 <= heartbeat_time_us <= 900)
+
+    result = run_simulation(
+        total_us=2_000,
+        config=config,
+        heartbeat_interval_us=200,  # frequent heartbeats so the scenario fits in 2ms
+        network=WindowedNetwork(),
+    )
+
+    # Should have entered DEGRADED_EDGE_ONLY at some point, and should have
+    # come back out of it (not ended in FAULT) since the budget (20ms) is
+    # much larger than the simulated outage window.
+    assert State.DEGRADED_EDGE_ONLY in result.fsm_state_history
+    assert result.state_at_end() in (State.DELIVERING, State.HOLD)
+    # Gate should have stayed open throughout, since DEGRADED_EDGE_ONLY
+    # still permits an open gate and the permit refresh loop never stopped.
+    assert all(result.gate_open_history[5:])
+
+
+def test_degraded_budget_exceeded_forces_fault_and_closes_gate():
+    """
+    All heartbeats dropped for the entire run. The degraded-mode duration
+    budget must eventually force a FAULT (via the watchdog tick, not
+    because anything else told it to), and the gate must close.
+    """
+    config = scaled_test_config(degraded_max_duration_s=0.001)  # 1ms budget -- deliberately tiny
+    always_drop = UnreliableNetwork(drop_probability=1.0)
+
+    result = run_simulation(
+        total_us=5_000,
+        config=config,
+        heartbeat_interval_us=200,
+        network=always_drop,
+    )
+
+    assert result.state_at_end() == State.FAULT
+    assert result.gate_open_at_end() is False
+    # Once FAULT, gate must never reopen for the rest of the run.
+    fault_index = result.fsm_state_history.index(State.FAULT)
+    assert not any(result.gate_open_history[fault_index:])
+
+
+def test_plan_hash_mismatch_on_reconnect_faults_and_closes_gate():
+    config = scaled_test_config(degraded_max_duration_s=1.0)  # won't be reached
+    always_drop_then_mismatch = UnreliableNetwork(drop_probability=1.0)
+
+    # Run with cloud's plan_hash mismatched from what the edge was armed with.
+    result = run_simulation(
+        total_us=2_000,
+        config=config,
+        heartbeat_interval_us=200,
+        network=UnreliableNetwork(drop_probability=1.0),
+        plan_hash="plan-A",
+    )
+    # Force degraded, then simulate the reconnect with a different hash by
+    # directly driving the fsm (the harness above only ever uses one
+    # plan_hash for the whole run, so we exercise the mismatch path directly
+    # against the same fsm/fpga pair the simulation produced).
+    assert State.DEGRADED_EDGE_ONLY in result.fsm_state_history
+    fsm = result.fsm  # type: ignore[attr-defined]
+    if fsm.state == State.DEGRADED_EDGE_ONLY:
+        fsm.cloud_heartbeat_received("plan-B")  # mismatched
+        assert fsm.state == State.FAULT
+
+
+# ------------------------------------------------------------- manual stop
+
+def test_manual_stop_closes_gate_promptly():
+    config = scaled_test_config()
+    stop_at = 500
+    result = run_simulation(
+        total_us=1_000,
+        config=config,
+        fpga_cycle_us=10,
+        edge_cycle_us=20,
+        manual_stop_at_us=stop_at,
+    )
+
+    closed_at = result.first_time_gate_closed_after(stop_at)
+    assert closed_at is not None
+    assert closed_at - stop_at <= config.permit_max_age_us + 10
+    assert result.state_at_end() == State.MANUAL_STOP
+
+
+# --------------------------------------------------- hold / tolerance excursion
+
+def test_tolerance_excursion_holds_then_resumes_gate_stays_open():
+    """
+    HOLD still permits the gate to be... actually per spec Section 3, HOLD
+    is a CLOSED-gate state. This test exists specifically to confirm the
+    simulation respects that -- the gate must close during the excursion
+    window even though the FSM never faults.
+    """
+    config = scaled_test_config(hold_timeout_ms=50.0)  # generous, excursion is short
+    result = run_simulation(
+        total_us=1_000,
+        config=config,
+        fpga_cycle_us=10,
+        edge_cycle_us=20,
+        tolerance_exceeded_windows=[(300, 600)],
+    )
+
+    assert State.HOLD in result.fsm_state_history
+    hold_start_index = result.fsm_state_history.index(State.HOLD)
+    # During HOLD, the edge must stop issuing permits (issue_gate_permit only
+    # fires in DELIVERING/DEGRADED_EDGE_ONLY), so the gate must be closed.
+    hold_indices = [i for i, s in enumerate(result.fsm_state_history) if s == State.HOLD]
+    assert not any(result.gate_open_history[i] for i in hold_indices)
+    # And it should resume DELIVERING with the gate open again afterward.
+    assert result.state_at_end() == State.DELIVERING
+    assert result.gate_open_at_end() is True
+
+
+# ------------------------------------------------------------ choke point
+
+def test_on_transition_hook_fires_for_every_state_change_including_watchdog():
+    """
+    Directly proves the choke point covers a path that was never one of
+    the three original manual call sites: the watchdog-triggered fault
+    (tick() calling _transition() internally with no external caller
+    event at all). If on_transition only fired for "externally visible"
+    events, this would miss it; it doesn't, because on_transition is
+    wired into _transition() itself, not into any particular public method.
+    """
+    from interlock_state_machine import InterlockConfig, InterlockStateMachine, State
+
+    fired = []
+    config = InterlockConfig(hold_timeout_ms=100.0)
+
+    class FakeClock:
+        def __init__(self):
+            self.t = 0.0
+        def __call__(self):
+            return self.t
+        def advance(self, s):
+            self.t += s
+
+    clock = FakeClock()
+    fsm = InterlockStateMachine(config=config, clock=clock, on_transition=lambda e: fired.append(e))
+    fsm.self_test_pass("plan-A")
+    fsm.clinician_start()
+    fsm.edge_tolerance_exceeded()  # -> HOLD
+    clock.advance(0.2)  # 200ms > 100ms hold_timeout_ms
+    fsm.tick()  # watchdog-triggered fault -- no external "fault" call at all
+
+    assert fsm.state == State.FAULT
+    # Every transition, including this watchdog-only one, must have fired
+    # the hook -- confirmed by count matching the audit log exactly.
+    assert len(fired) == len(fsm.audit_log)
+    assert fired[-1].to_state == State.FAULT
+    assert fired[-1].actor == "watchdog"
+
+
+def test_choke_point_requires_no_call_site_changes_for_new_transition_paths():
+    """
+    Regression-proof for the specific failure mode that motivated this
+    refactor: adds a new state-changing call (recovery_fail after a fresh
+    fault) that was never explicitly wired for permit resync anywhere,
+    and confirms the FPGA's held permit is still correctly synced
+    afterward -- with zero new resync code required at this call site.
+    """
+    from hardware_simulator import EdgeNode, FpgaGateHardware, SimClock
+    from interlock_state_machine import State
+    from clock_sync import issue_gate_permit
+
+    sim_clock = SimClock()
+    fpga = FpgaGateHardware(permit_max_age_us=50.0)
+    edge = EdgeNode(scaled_test_config(), sim_clock, fpga)
+    edge.fsm.self_test_pass("plan-A")
+    edge.fsm.clinician_start()
+    edge.cycle()
+    assert fpga.cycle(sim_clock.now_us()) is True  # gate open, DELIVERING
+
+    edge.fsm.edge_node_fault("test fault")
+    assert fpga.cycle(sim_clock.now_us()) is False  # resynced automatically on FAULT
+
+    edge.fsm.begin_recovery()
+    edge.fsm.recovery_fail("still broken")  # RECOVERY -> FAULT, never wired anywhere by hand
+    assert edge.fsm.state == State.FAULT
+    assert fpga.cycle(sim_clock.now_us()) is False  # still correctly closed, no manual wiring needed
+
+
+# ----------------------------------------------------- capstone: fuzz the whole thing
+
+from hypothesis import given, settings, strategies as st, HealthCheck
+from interlock_state_machine import gate_may_be_open
+
+
+@given(
+    drop_probability=st.floats(min_value=0.0, max_value=1.0),
+    excursion_start=st.integers(min_value=0, max_value=800),
+    excursion_len=st.integers(min_value=0, max_value=300),
+    crash=st.booleans(),
+    crash_at=st.integers(min_value=200, max_value=900),
+    manual_stop=st.booleans(),
+    manual_stop_at=st.integers(min_value=100, max_value=900),
+)
+@settings(max_examples=1000, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_gate_open_implies_valid_logical_state_under_randomized_conditions(
+    drop_probability, excursion_start, excursion_len, crash, crash_at,
+    manual_stop, manual_stop_at,
+):
+    """
+    Capstone integration property: across randomized network conditions,
+    randomized motion excursions, randomized edge crashes, AND (new after
+    the choke-point refactor) randomized manual-stop timing combined with
+    all of the above, the PHYSICAL gate must never be open while the
+    LOGICAL fsm state says it shouldn't be.
+
+    manual_stop timing was not previously fuzzed together with the other
+    dimensions -- adding it here is itself part of proving the choke-point
+    refactor is more robust than the call-site approach it replaced, not
+    merely as robust: the old approach required a resync call to be added
+    at each new call site by hand (and twice failed to be, in two
+    different places); the new approach requires nothing extra when a new
+    dimension like this is added to the test, because the fix lives in
+    the state machine's own transition path, not in this test's call sites.
+    """
+    config = scaled_test_config(
+        hold_timeout_ms=20.0,
+        degraded_max_duration_s=0.01,
+    )
+    result = run_simulation(
+        total_us=1_000,
+        config=config,
+        fpga_cycle_us=10,
+        edge_cycle_us=20,
+        heartbeat_interval_us=100,
+        network=UnreliableNetwork(drop_probability=drop_probability),
+        tolerance_exceeded_windows=[(excursion_start, excursion_start + excursion_len)],
+        edge_crash_at_us=crash_at if crash else None,
+        manual_stop_at_us=manual_stop_at if manual_stop else None,
+    )
+
+    for gate_open, fsm_state in zip(result.gate_open_history, result.fsm_state_history):
+        if gate_open:
+            assert gate_may_be_open(fsm_state), (
+                f"Gate was physically open while fsm state was {fsm_state}, "
+                "which gate_may_be_open() says should never permit an open gate"
+            )

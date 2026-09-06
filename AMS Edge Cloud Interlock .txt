@@ -1,0 +1,66 @@
+AntimatterSim v10 — Edge-Cloud Interlock State Machine Spec (Tier 0)
+
+Status: Draft for review — this is a starting design, not a validated safety document. It must go through formal hazard analysis (FMEA/FTA) and independent review before implementation.
+
+1. Purpose
+
+Three control loops currently operate at different timescales with no documented arbitration:
+
+LoopActorUpdate rateRoleBeam gateFPGA~5 µsHard real-time ON/OFF of beam deliveryLocal motion/dose inferenceJetson edge node (ROM model)~1 msShort-horizon position/dose prediction, gate-hold decisionsAdaptive replanningCloud digital twin~100 msFull-fidelity replanning, longer-horizon adjustment 
+
+This spec defines what each actor is authoritative for, how they detect disagreement or loss of contact, and what the system does by default when something goes wrong. The governing principle throughout:
+
+Absence of a valid, current, in-tolerance signal is treated as a stop condition, not a continue condition. The system fails to BEAM OFF, never fails to BEAM ON.
+
+2. Actors and Authority Boundaries
+
+FPGA (gate controller): Sole authority to physically open the beam gate. It only opens the gate when it holds a currently-valid "gate permit" token from the Jetson edge node. It never asks the cloud directly — the cloud only acts through the edge node.
+
+Jetson edge node: Authoritative for sub-second gate-hold/gate-release decisions based on local ROM inference (patient position, breathing phase, instantaneous dose accumulation vs. plan). Issues or withholds the gate permit token to the FPGA. Consumes plan updates from the cloud but does not block on them.
+
+Cloud digital twin: Authoritative for full plan validity, longer-horizon adaptive replanning, and Pareto-plan selection review status. Publishes plan updates and a periodic liveness heartbeat to the edge node. Cannot open a beam gate directly and cannot override an edge-issued STOP.
+
+Rule: authority only flows downward in time-resolution (cloud → edge → FPGA) for permissive actions. Any actor can independently issue a STOP, and a STOP from a faster loop always overrides a slower loop's permissive state.
+
+3. States
+
+StateDescriptionBeam gateINITSystem startup, self-test, calibrationClosedARMEDAll actors have exchanged valid handshakes; plan loaded; awaiting clinician startClosedDELIVERINGNormal treatment delivery; edge node actively issuing gate permits per pulse/spotOpen per FPGA permit logicHOLDEdge node has withheld the gate permit (e.g., motion out of tolerance, dose ahead of plan) but no fault declaredClosedDEGRADED_EDGE_ONLYCloud heartbeat lost; edge node continues on last-known-good plan within a bounded time/dose budgetOpen per FPGA permit logic, budget-limitedFAULTAny actor has detected an unresolvable disagreement, watchdog timeout, or out-of-tolerance conditionClosed, latchedMANUAL_STOPClinician-initiated stopClosed, latchedRECOVERYPost-fault diagnostic and re-arm sequenceClosedCOMPLETEFraction delivered per plan, normal terminationClosed 
+
+4. Transition Table
+
+FromEventToNotesINITSelf-test pass, handshake with edge + cloud confirmedARMEDHandshake includes clock sync check between FPGA/edge/cloudINITSelf-test fail, handshake timeoutFAULTNo path to ARMED without full handshakeARMEDClinician start commandDELIVERINGRequires human-in-the-loop confirmation (Tier 0 review gate)DELIVERINGEdge node: motion/dose within toleranceDELIVERINGSteady state; gate permits issued per normal cadenceDELIVERINGEdge node: motion/dose transiently out of toleranceHOLDNot a fault — expected during breathing motion excursionsHOLDEdge node: back within toleranceDELIVERINGResume without cloud involvementHOLDHold duration exceeds configured max (hold_timeout_ms)FAULTPersistent inability to resume is itself a hazard signalDELIVERING / HOLDCloud heartbeat missed onceDELIVERING / HOLD (unchanged)Single miss logged, not actioned — avoid flapping on transient network blipsDELIVERING / HOLDCloud heartbeat missed n consecutive times (configurable, e.g. 3)DEGRADED_EDGE_ONLYEdge continues on last-known-good planDEGRADED_EDGE_ONLYCloud heartbeat restored, plan hash matches last-known-goodDELIVERING or HOLD (per current tolerance state)Reconciliation, not silent resume — logged as an eventDEGRADED_EDGE_ONLYCloud heartbeat restored, plan hash mismatchFAULTCloud believes a different plan is active than what edge is delivering — must not auto-reconcileDEGRADED_EDGE_ONLYDegraded-mode time or dose budget exceededFAULTEdge-only operation is bounded, not indefiniteDELIVERING / HOLD / DEGRADED_EDGE_ONLYEdge node itself faults (ROM inference error, sensor dropout, FPGA/edge link lost)FAULTFaster loop failing is always terminal — no degraded mode below edgeDELIVERING / HOLD / DEGRADED_EDGE_ONLYCloud declares its own committed plan invalid (e.g., post-hoc constraint violation detected)FAULTCloud cannot force a stop through the edge in real time, but it can set a "cloud fault" flag; the edge treats this as equivalent to a missed-heartbeat escalation, collapsed to FAULT on next cycleAny active stateClinician manual stopMANUAL_STOPAlways available, always highest priority, hardware E-stop path independent of software statesFAULT / MANUAL_STOPDiagnostic sequence initiated by qualified operatorRECOVERYNo automatic recovery from FAULTRECOVERYRoot cause identified, re-verification passed, clinician re-authorizationARMEDFull re-handshake required, same as INIT → ARMEDRECOVERYRe-verification failsFAULTDELIVERINGPlan fraction complete per dose scorerCOMPLETENormal end state 
+
+5. Disagreement Resolution Logic
+
+Disagreement can occur at two boundaries:
+
+Edge vs. FPGA: Not really a "disagreement" — the FPGA has no independent judgment, it only checks permit validity (signed/timestamped token, not stale beyond permit_max_age_us). A stale or missing permit closes the gate. This boundary is deliberately simple by design: the fastest loop should have the least logic.
+
+Edge vs. Cloud: This is the substantive disagreement case, covered by the DEGRADED_EDGE_ONLY and plan-hash-mismatch paths above. Key design decisions to make explicit and get reviewed:
+
+What counts as "last-known-good plan"? Proposal: the most recent cloud plan update for which the edge node completed full validation (hash check, constraint check against zkp.constraints bounds) before heartbeat loss — not simply "whatever the edge was last executing."
+
+Degraded-mode budget. Needs concrete default values before implementation, e.g. degraded_max_duration_s and degraded_max_dose_fraction_pct (dose delivered while in DEGRADED_EDGE_ONLY as a fraction of total planned dose). These should be clinically reviewed, not just engineering defaults.
+
+No silent auto-reconciliation. A plan-hash mismatch on reconnect always goes to FAULT, even if the cloud's new plan is "more correct." Auto-adopting a different plan mid-delivery without clinician awareness is itself a hazard.
+
+6. Logging and Audit Requirements
+
+Every state transition must be logged with: timestamp (synchronized clock domain), triggering actor, prior state, new state, and — for FAULT/DEGRADED_EDGE_ONLY transitions — the specific tolerance/heartbeat/hash value that triggered it. This log is the actual substance behind any later "proof of correctness" claim (see Tier 0 note on rescoping the zk-SNARK claim): it should be the auditable record of what happened, independent of whether a cryptographic proof is layered on top.
+
+7. Open Items Requiring Review Before Implementation
+
+[ ] Concrete default values for hold_timeout_ms, consecutive-heartbeat-miss threshold, degraded_max_duration_s, degraded_max_dose_fraction_pct, permit_max_age_us.
+
+[ ] Formal FMEA covering each transition, especially the DEGRADED_EDGE_ONLY path — needs sign-off from clinical physics, not just software.
+
+[ ] Independent hardware E-stop path confirmed to bypass all software states (should not depend on FPGA logic being correct).
+
+[ ] Clock synchronization method between FPGA, edge, and cloud (needed for permit staleness checks and log ordering) — NTP is likely insufficient for the µs-scale permit check; consider PTP or a hardware timestamp source.
+
+[ ] Behavior during RECOVERY if a second fault occurs mid-diagnostic.
+
+[ ] Whether DEGRADED_EDGE_ONLY should be permitted at all for a first clinical deployment, versus treating any cloud heartbeat loss as an immediate FAULT until the mode has field validation history.
+
+This spec covers the control-loop interlock only. It assumes the Tier 0 human-in-the-loop review gate and IEC 62304 traceability process (from the risk-prioritized roadmap) are being developed in parallel, since several transitions here reference clinician-authorization steps that depend on that workflow being defined.
+

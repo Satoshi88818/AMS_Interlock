@@ -1,0 +1,40 @@
+AntimatterSim v10 — Risk-Prioritized Roadmap
+
+This roadmap restructures the v10 "seven pillars" around patient-safety impact and regulatory exposure rather than technical novelty. Items are grouped into four tiers, followed by suggested sequencing.
+
+Tier 0 — Must exist before any of this ships (safety/regulatory foundation)
+
+Nothing in later tiers should be built on top of a system that lacks these. These are preconditions, not features.
+
+ItemWhy it's Tier 0EffortFail-safe/interlock spec for edge-cloud beam controlThree control loops exist (FPGA µs-gating, Jetson ms-inference, cloud 100ms replanning) with no documented behavior on disagreement or node failure. This is the actual safety-critical path.Design doc + formal state machine, then implementIEC 62304 / ISO 14971 traceability scaffoldingSoftware lifecycle and risk-management process needs to exist alongside the code, not be retrofitted after "Level 10 complete."Process, not code — start now, low cost, high cost to deferHuman-in-the-loop review gateEvery automated plan (Pareto frontier, ZKP-blessed, federated model output) needs an explicit clinician sign-off step defined in the architecture, not implied.Design + UI workflowReframe the zk-SNARK claimCurrently overstates what's proven (execution-of-circuit ≠ clinical safety). Ship only after the claim is scoped correctly in docs, UI, and any regulatory submission language.Documentation fix — cheap, do immediately 
+
+Tier 1 — High clinical value, tractable risk
+
+Items that directly improve treatment quality/safety and are technically well-understood.
+
+ItemValueRisk if done wrongNotesTensorRT + CUDA texture DIR accelerationFaster, more accurate deformable registration for 4D motion trackingLow — established acceleration techniqueGood near-term win; validate against existing scipy.ndimage baseline (benchmark already exists)Multi-objective Pareto planning (NSGA-III / Bayesian)Real clinical value: exposes TCP/NTCP tradeoffs instead of one weighted answerMedium — 247 candidate plans need a defined, auditable reduction-to-decision workflow for the clinicianPrioritize knee-point-selection UX and the review step over scaling to 10,000 Ray-Tune workersEdge inference for beam gating latency (Jetson/FPGA)Tighter control loop, real patient benefit if motion compensation improvesMedium-high — new failure modes at the hardware layerShould follow, not precede, the Tier 0 interlock spec 
+
+Tier 2 — Real value, but overbuilt as specified — right-size before building
+
+ItemProblem with current specRight-sized versionJAX auto-diff physics engine"Exact gradients through Monte Carlo" oversells what's achievable through stochastic branchingStart with differentiable surrogate regions or reparameterized sub-kernels (e.g., differentiable dose-deposition, non-differentiable nuclear branching held fixed); validate against the PyTorch surrogate rather than claiming exactnessFederated learning (NVFlare/PySyft)ε=1.0 DP budget doesn't support the "impossible to memorize" claim; only 3 min clients/round is thinTighten privacy accounting, document composition across 100 rounds, raise min-clients threshold, correct the marketing claim to match the actual guaranteePlanetary multi-region serverless deployment10,000 concurrent functions across 3 regions for what is fundamentally per-patient computation — cost/complexity likely disproportionate to benefitStart with one well-provisioned regional cluster with autoscaling; revisit multi-region only if there's a demonstrated latency or compliance driver (e.g., GDPR data residency is a legitimate reason — scale-out for its own sake isn't) 
+
+Tier 3 — Defer or cut
+
+ItemReasoningzk-SNARK proof generation (as a "safety proof")Keep only if rescoped to "proof of computational integrity" (e.g., proving the delivered plan matches the reviewed/approved plan — a legitimate audit-trail use case). Drop the "proves clinical safety" framing entirely.WebAssembly edge runtime (wasmtime)Unclear what problem this solves that the FPGA/Jetson edge path doesn't already cover. Cut unless there's a specific portability requirement driving it."MAXIMUM PHYSICS MODE" (all flags simultaneously)Exists as a usage example with no corresponding integration test. Either build the integration test suite for combined-flag states or remove the example — it currently documents an untested configuration. 
+
+Suggested Sequencing
+
+Now: Tier 0 documentation fixes (especially ZKP/DP language) — cheap, removes the biggest credibility/regulatory risk immediately.
+
+Next: Tier 0 interlock design + Tier 1 TensorRT DIR (independent, low-risk, ships value fast).
+
+Then: Tier 1 Pareto planning with a real clinician-review workflow, followed by edge inference — gated on the interlock spec being done first.
+
+Later, rescoped: JAX differentiable physics (partial-differentiability approach) and federated learning (fixed privacy accounting).
+
+On hold pending a real driver: planetary multi-region deployment, Wasm edge runtime.
+
+Cut or fundamentally rescope: the "safety proof" framing of zk-SNARKs.
+
+Next candidate artifact: a formal state-machine spec for the Tier 0 edge-cloud interlock (states, transitions, fallback behavior on edge/cloud disagreement) — highest leverage next step since later tiers depend on it.
+
